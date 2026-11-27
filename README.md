@@ -4,7 +4,13 @@ An MCP server that exposes [Arcane](https://getarcane.app) Docker management cap
 
 Covers the core Docker management API: containers, images, volumes, networks, Compose projects, registries, vulnerability scanning, port mappings, webhooks, system management, updater, activities/events, and environment management.
 
-**125 tools across 14 modules.**
+**127 tools across 14 modules.**
+
+> **Requires Arcane v3.0.0 or newer** (developed against v3.1.1). The v2 API was
+> dropped in 1.0.0: v3 renamed `/api/environments` to `/api/agents`, moved resource
+> actions onto query parameters (`POST /containers/{id}?action=start`), and changed
+> project deploy to `/projects/{id}/deploy`. If you are still on Arcane 2.x, pin
+> `arcane-mcp` at `0.4.0` — that is the last release with v2 support.
 
 ## Install
 
@@ -25,35 +31,127 @@ uv sync
 
 ## Configuration
 
-Set these environment variables (or put them in a `.env` file in the working directory):
+Two environment variables, and that is the whole config:
 
-```env
-ARCANE_API_KEY=arc_your_api_key_here
-ARCANE_BASE_URL=http://localhost:3552
-```
+| Variable | Purpose |
+|---|---|
+| `ARCANE_BASE_URL` | Your Arcane instance, e.g. `https://arcane.example.com:3552` |
+| `ARCANE_API_KEY` | API key from Arcane → Settings → API Keys |
 
-### OpenCode
+Pass them in your MCP client's config (below). A `.env` is read only when the server is launched
+from the directory containing it, so the client config is the reliable path.
 
-Add to your `opencode.json`:
+### OpenCode v2
 
-```json
+`~/.config/opencode/opencode.jsonc`:
+
+```jsonc
 {
+  "$schema": "https://opencode.ai/config.json",
   "mcp": {
-    "arcane-docker": {
+    "arcane-mcp": {
       "type": "local",
       "command": ["arcane-mcp"],
-      "env": {
-        "ARCANE_API_KEY": "arc_your_key_here",
-        "ARCANE_BASE_URL": "http://localhost:3552"
+      "environment": {
+        "ARCANE_BASE_URL": "https://arcane.example.com:3552",
+        "ARCANE_API_KEY": "{env:ARCANE_API_KEY}"
       }
     }
   }
 }
 ```
 
-Or set environment variables globally and omit them from the config.
+Declare the server flat under `mcp`. OpenCode's docs show a `mcp.servers` nesting, but the shipping
+v2.0.26 build does not read servers declared there — verified with `opencode mcp list`, which reports
+none configured. `{env:VAR}` is OpenCode's own syntax; a shell `$VAR` is not expanded.
+v2 enables `codemode` by default, so tools surface as `tools.arcane_mcp.list_containers`.
 
-## Tools (125 total)
+### Claude Code
+
+```bash
+claude mcp add arcane-mcp \
+  --env ARCANE_BASE_URL=https://arcane.example.com:3552 \
+  --env ARCANE_API_KEY=your-key \
+  --transport stdio \
+  -- arcane-mcp
+```
+
+`--transport stdio` must come between the last `--env` and the server name: with a name directly
+after `--env`, the CLI reads it as another `KEY=value` pair. Add `--scope project` to write a
+committable `.mcp.json` instead of the default local scope.
+
+### Claude Desktop
+
+`~/Library/Application Support/Claude/claude_desktop_config.json` (macOS),
+`%APPDATA%\Claude\claude_desktop_config.json` (Windows),
+`~/.config/Claude/claude_desktop_config.json` (Linux):
+
+```json
+{
+  "mcpServers": {
+    "arcane-mcp": {
+      "command": "arcane-mcp",
+      "args": [],
+      "env": {
+        "ARCANE_BASE_URL": "https://arcane.example.com:3552",
+        "ARCANE_API_KEY": "your-key"
+      }
+    }
+  }
+}
+```
+
+Desktop does not document variable interpolation — put the key in literally, then restart the app
+fully.
+
+### Cursor
+
+`.cursor/mcp.json` (project) or `~/.cursor/mcp.json` (global):
+
+```json
+{
+  "mcpServers": {
+    "arcane-mcp": {
+      "type": "stdio",
+      "command": "arcane-mcp",
+      "args": [],
+      "env": {
+        "ARCANE_BASE_URL": "https://arcane.example.com:3552",
+        "ARCANE_API_KEY": "${env:ARCANE_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+### VS Code
+
+Portable form at the workspace root, `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "arcane-mcp": {
+      "type": "stdio",
+      "command": "arcane-mcp",
+      "args": [],
+      "env": {
+        "ARCANE_BASE_URL": "https://arcane.example.com:3552",
+        "ARCANE_API_KEY": "${ARCANE_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+The older editor-managed `.vscode/mcp.json` with a `"servers"` key still works but is deprecated, and
+it uses a different substitution syntax (`${env:NAME}`).
+
+## Tools (127 total)
+
+Seven tools have no Arcane v3 endpoint and return an explicit notice instead of calling the API:
+`exec_in_container`, `get_container_logs`, `get_container_stats`, `create_volume_directory`,
+`upload_to_volume`, `delete_volume_file`, `trigger_webhook`.
 
 ### Containers (18)
 list_containers, inspect_container, create_container, start_container, stop_container, restart_container, kill_container, pause_container, unpause_container, remove_container, redeploy_container, commit_container, update_container, set_container_auto_update, exec_in_container, get_container_logs, get_container_stats, get_container_counts
@@ -94,8 +192,8 @@ run_updater, get_updater_status, get_updater_history
 ### Ports (1)
 list_ports
 
-### Operations / Safety (2)
-confirm_operation, read_audit_log
+### Operations / Safety (4)
+confirm_operation, read_audit_log, get_operation_status, classify_tool
 
 ## Usage
 
@@ -147,6 +245,11 @@ cd arcane-mcp
 uv sync
 uv run fastmcp run src/arcane_mcp/server.py
 ```
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md). 0.4.0 fixed the Compose project create/update/teardown
+payloads and added runtime support for Arcane v3's `/api/agents` routes.
 
 ## License
 

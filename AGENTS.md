@@ -3,7 +3,7 @@
 MCP server that exposes the [Arcane API](https://getarcane.app/api-reference) to AI agents.
 Built with **FastMCP (Python)** and managed with **UV**.
 
-**Status:** Active development. 125 tools across 14 categories covering all major Arcane API endpoints.
+**Status:** Active development. 127 tools across 14 categories covering all major Arcane API endpoints.
 
 ---
 
@@ -30,7 +30,32 @@ uv build                                            # Build wheel
 uv publish                                          # Push to PyPI
 ```
 
-**Note:** No lint/typecheck config exists yet. No test suite either — run `uv run` directly for ad-hoc verification.
+**Note:** ruff and mypy are configured in `pyproject.toml`; the suite runs with `uv run pytest`.
+`ARCANE_API_VERSION=2` is pinned by `tests/conftest.py` so route tests stay off the network.
+
+---
+
+## Releasing — two repos must agree
+
+The code lives in **GitHub** (`MikeCase/arcane-mcp`); the landing page lives in **Forgejo**
+(`fj.splaq.us/splaq/arcane-mcp-site`) and is served at <https://arcanemcp.splaq.us>. Nothing links
+them, so a release means touching both or the page quietly lies about the version.
+
+1. **Code repo** — bump `pyproject.toml` `version`, add a `CHANGELOG.md` entry, commit, push to
+   `origin` (GitHub).
+2. **Count the tools** (only when tools were added or removed):
+   ```bash
+   grep -rh '@mcp.tool()' src/arcane_mcp/tools/*.py | wc -l
+   ```
+3. **Site repo** — clone `git@fj.splaq.us:splaq/arcane-mcp-site.git`, then update three places in
+   `index.html`: the hero badge, the stats block (`stat-number`), and the architecture caption
+   (`<div class="desc">`). Commit and push to `main`.
+4. **Verify** — Arcane's GitOps sync publishes within ~5 minutes:
+   ```bash
+   curl -s https://arcanemcp.splaq.us | grep -o 'v[0-9.]* &middot; [0-9]* tools'
+   ```
+
+Skipping step 3 is how the badge sat at `v0.3.0 · 125 tools` while the server was `0.4.0` with 127.
 
 ---
 
@@ -57,7 +82,7 @@ def require_client() -> httpx.AsyncClient:
 
 ```python
 from fastmcp import FastMCP
-from ..client import require_client, _build_headers
+from ..client import env_path, require_client, _build_headers
 
 def register(mcp: FastMCP) -> None:
     @mcp.tool()
@@ -65,7 +90,8 @@ def register(mcp: FastMCP) -> None:
         """Tool docstring becomes MCP tool description."""
         client = require_client()
         try:
-            resp = await client.get(f"/api/environments/{env_id}/...", headers=_build_headers(agent_token))
+            url = await env_path(env_id, "/some/resource")
+            resp = await client.get(url, headers=_build_headers(agent_token))
             resp.raise_for_status()
             return resp.json()
         except httpx.HTTPStatusError as e:
@@ -73,6 +99,10 @@ def register(mcp: FastMCP) -> None:
         except Exception as e:
             return {"error": str(e)}
 ```
+
+**Never hardcode `/api/environments/{env_id}`.** Build every route with `env_path(env_id, suffix)`
+(or `api_collection()` for the environment collection, which has no `env_id`). See
+"API version detection" below for why.
 
 ### Key conventions
 
@@ -115,16 +145,45 @@ src/arcane_mcp/
 - Auth via `X-Api-Key` header (NOT Bearer token), added at client construction
 - Remote agents send `X-Arcane-Agent-Token` header via `_build_headers(agent_token)`
 - Default Arcane port: 3552 (`http://localhost:3552`)
-- API is multi-tenant: `/api/environments/{env_id}/{resource}`
+- API is multi-tenant: `/api/agents/{env_id}/{resource}`. **v3+ only** — the v2 `/api/environments`
+  routes were dropped in 1.0.0 (Arcane 2.x users must pin `0.4.0`).
 - Environment "0" = default local. Remote agents use UUIDs.
 - Interactive API docs live **in the Arcane UI** at Settings → API Keys → API Reference
-- Arcane CLI: `arcane-cli config set` for reference
+- The full OpenAPI spec is served at `GET /api/openapi.json` — the fastest way to settle any
+  contract question (field names, content types, method). Do not guess at payload shapes.
+
+### API targeting (v3 only)
+
+Arcane **v3.0.0** renamed `/api/environments` → `/api/agents` (PR #4731), moved resource *actions*
+onto query parameters, and switched project update to `PATCH`. **1.0.0 dropped v2 entirely** — there
+is no runtime branching left.
+
+| Helper | Returns |
+|---|---|
+| `await api_prefix(env_id)` | `/api/agents/{env_id}` |
+| `await api_collection()` | `/api/agents` (no `env_id`) |
+| `await env_path(env_id, suffix)` | `api_prefix(env_id) + suffix` |
+| `await paginate_all(url, params)` | one merged envelope, walking every page |
+
+Three things about v3 that bite:
+
+- **Actions are query params**, not sub-paths: `POST /containers/{id}?action=start`,
+  `POST /projects/{id}?action=down|restart|archive|unarchive|updateservices`,
+  `POST /system/containers?action=startall|startstopped|stopall`. Project up/redeploy/pull is
+  `POST /projects/{id}/deploy?action=...` with a `ProjectDeployOptions` body.
+- **Lists paginate at 20** with a `pagination.hasNextPage` envelope. Any tool that lists things must
+  go through `paginate_all`, or an agent silently sees the first 20 of 35.
+- `GET /system/health` is gone — **HEAD** only.
+
+Resolve endpoints at **proposal time** when storing them on a confirmation token, so the token
+carries the fully-qualified path. `detect_api_version()` still exists (cached, from `GET /api/version`)
+for diagnostics; routes no longer branch on it.
 
 ---
 
 ## Arcane API Key Endpoints
 
-Base: `/api/environments/{env_id}`
+Base: `/api/environments/{env_id}` on v2, `/api/agents/{env_id}` on v3 — always build routes with `env_path()`. The full spec is at `GET /api/openapi.json`.
 
 | Resource | Endpoints |
 |----------|-----------|
@@ -132,10 +191,29 @@ Base: `/api/environments/{env_id}`
 | Images | GET `/images`, GET `/images/{id}`, POST `/images/pull\|prune\|build\|search\|upload`, DELETE `/images/{id}`, POST `/images/{name}/tag`, GET `/images/{name}/history\|export\|attestations` |
 | Volumes | GET `/volumes`, GET `/volumes/{name}`, POST `/volumes\|prune`, DELETE `/volumes/{name}`, GET/POST `/volumes/{name}/browse` (full file browser), POST `/volumes/{name}/backups` |
 | Networks | GET `/networks`, GET `/networks/{id}`, POST `/networks\|prune`, DELETE `/networks/{id}`, POST `/networks/{id}/connect\|disconnect` |
-| Projects | GET `/projects`, GET `/projects/{id}`, POST `/projects`, PUT `/projects/{id}`, DELETE `/projects/{id}`, POST `/projects/{id}/up\|down\|restart\|redeploy\|build\|archive\|unarchive\|destroy` |
+| Projects | GET `/projects`, GET `/projects/{id}`, **POST `/projects` (multipart — see below)**, PUT `/projects/{id}` on v2 / **PATCH** on v3 (JSON), DELETE `/projects/{id}`, POST `/projects/{id}/up\|down\|restart\|redeploy\|build\|archive\|unarchive\|destroy` |
 | System | GET `/system/docker/info`, POST `/system/prune`, GET `/version`, POST `/system/containers/start-all\|start-stopped\|stop-all`, GET/POST `/system/upgrade` |
-| Environments | GET `/environments`, GET `/environments/{id}`, POST `/environments`, PUT `/environments/{id}`, DELETE `/environments/{id}` |
+| Environments | GET `/environments`, GET `/environments/{id}`, POST `/environments`, PUT `/environments/{id}`, DELETE `/environments/{id}` — v3 calls these `/agents` (`api_collection()`) |
 | Webhooks | POST `/api/webhooks/trigger/{token}` (env-independent, token is in URL) |
+
+### Project create is multipart-only
+
+`POST /projects` has taken **`multipart/form-data`** since Arcane v2.8.0, and there is no JSON
+variant (a JSON body returns `422 cannot read multipart form`). Two mandatory text parts, exactly
+one each:
+
+| Part | Content |
+|---|---|
+| `project` | JSON string: `{"name": "...", "composeContent": "<compose yaml>", "envContent"?, "directory"?, "tags"?}` |
+| `manifest` | JSON string workspace manifest; send `{"fileChanges": []}` for a plain create |
+
+The compose text lives in `composeContent` **inside the `project` part** — there is no top-level
+`compose` field on any version. Optional `files` parts are real uploads referenced by
+`manifest.fileChanges[].uploadIndex`. Success is `200`, not `201`.
+
+Confirmation tokens carry an `encoding` (`"json"` or `"multipart"`) so `confirm_operation()` replays
+the body correctly; `multipart` bodies must be a flat `dict[str, str]`.
+
 
 ---
 
@@ -143,19 +221,32 @@ Base: `/api/environments/{env_id}`
 
 Any tool that removes, prunes, force-stops, or overwrites must:
 
-1. Accept `confirm: bool = False` parameter
-2. Return `{"warning": "...", "target": ...}` dict if `confirm=False`
-3. Gate the real operation behind `if not confirm: return warning_dict`
+Destructive and high-risk writes do **not** execute on call. They propose, then require a second call.
 
-Example from `containers.py`:
+1. The tool builds the operation and calls `get_token_store().create(...)` with the action, target,
+   fully-resolved endpoint (see `env_path`), method, body, `encoding`, and classification.
+2. It returns a proposal dict: `confirmation_token`, `operation_hash`, `classification`,
+   `risk_level`, `warning`, `target`, `action` — and, for compose, a parsed plan. Nothing is sent.
+3. The caller then invokes `confirm_operation(token=..., operation_hash=...)`, which consumes the
+   token, re-checks the resource hash, replays the request, and writes three audit events.
+
+Example shape from `containers.py`:
 ```python
-async def remove_container(container_id: str, force: bool = False,
-                           env_id: str = "0", agent_token: str | None = None,
-                           confirm: bool = False) -> Any:
-    if not confirm:
-        return {"warning": "Destructive operation. Set confirm=True to remove this container.",
-                "container_id": container_id}
+token = get_token_store().create(
+    action="remove_container",
+    target=container_id,
+    endpoint=await env_path(env_id, f"/containers/{container_id}"),
+    method="DELETE",
+    body=None, params=None,
+    classification=ToolClass.DESTRUCTIVE_WRITE,
+    env_id=env_id, agent_token=agent_token,
+)
+return {"warning": "...", "confirmation_token": token,
+        "operation_hash": compute_operation_hash("remove_container", container_id, None, None), ...}
 ```
+
+Tokens live in memory, expire after 120 s, and are bound to the operation hash (which covers action,
+target, body and params) — changing any argument invalidates the token.
 
 ---
 

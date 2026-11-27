@@ -9,19 +9,19 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-_TOKEN_TTL = 120          # seconds before a token expires
+_TOKEN_TTL = 120  # seconds before a token expires
 _POLICY_VERSION = "1.0.0"  # bumped when safety semantics change
 
 # ── Tool Classification ──
 
 
-class ToolClass(str, Enum):
+class ToolClass(str, Enum):  # noqa: UP042 — StrEnum would change str(member)
     READ = "read"
     REVERSIBLE_WRITE = "reversible_write"
     DESTRUCTIVE_WRITE = "destructive_write"
@@ -110,6 +110,7 @@ class TokenStore:
         agent_token: str | None = None,
         classification: str = ToolClass.DESTRUCTIVE_WRITE,
         resource_hash: str | None = None,
+        encoding: str = "json",
     ) -> str:
         """Create a confirmation token bound to the exact operation.
 
@@ -122,9 +123,23 @@ class TokenStore:
             ``compute_resource_hash``).  When set, ``confirm_operation()``
             will re-fetch the resource and compare; a mismatch denies the
             confirmation.
+        encoding:
+            How ``confirm_operation()`` must send ``body`` and read the
+            response: ``"json"`` (default) sends it as an
+            ``application/json`` request body and parses the reply as JSON;
+            ``"multipart"`` sends it as ``multipart/form-data`` form fields;
+            ``"stream"`` behaves like ``"json"`` on the request side (no body
+            for the upgrade call) but parses the reply as a newline-delimited
+            ``application/x-json-stream`` action log via
+            ``parse_stream_response()``, because ``resp.json()`` raises
+            ``Extra data`` on those bodies.  For ``"multipart"``, ``body``
+            must be a flat ``dict[str, str]`` whose values are already
+            serialized (e.g. JSON strings).
 
         Returns the hex token string.
         """
+        if encoding not in ("json", "multipart", "stream"):
+            raise ValueError(f"encoding must be 'json', 'multipart' or 'stream', got {encoding!r}")
         operation_hash = compute_operation_hash(action, target, body, params)
         session_id = agent_token or "local"
         token = uuid.uuid4().hex[:12]
@@ -141,13 +156,18 @@ class TokenStore:
             "classification": classification,
             "operation_hash": operation_hash,
             "resource_hash": resource_hash,
+            "encoding": encoding,
             "session_id": session_id,
             "policy_version": _POLICY_VERSION,
             "expires": time.time() + _TOKEN_TTL,
         }
         logger.info(
             "Token %s: %s %s (op_hash=%s class=%s)",
-            token, action, target, operation_hash, classification,
+            token,
+            action,
+            target,
+            operation_hash,
+            classification,
         )
         return token
 
@@ -170,7 +190,9 @@ class TokenStore:
         if operation_hash is not None and entry["operation_hash"] != operation_hash:
             logger.warning(
                 "Token %s operation_hash mismatch: got %s, expected %s",
-                token, operation_hash, entry["operation_hash"],
+                token,
+                operation_hash,
+                entry["operation_hash"],
             )
             return None
         return entry
@@ -207,11 +229,7 @@ class AuditLog:
     """
 
     def __init__(self, path: str | None = None) -> None:
-        self.path = (
-            path
-            or os.environ.get("ARCANE_MCP_AUDIT_LOG")
-            or os.path.expanduser("~/.arcane-mcp-audit.log")
-        )
+        self.path = path or os.environ.get("ARCANE_MCP_AUDIT_LOG") or os.path.expanduser("~/.arcane-mcp-audit.log")
 
     def log_proposed(
         self,
@@ -228,7 +246,7 @@ class AuditLog:
         """Event 1: operation was proposed (token created)."""
         entry: dict[str, Any] = {
             "event": "operation_proposed",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "token": token,
             "action": action,
             "target": target,
@@ -251,14 +269,16 @@ class AuditLog:
         env_id: str = "0",
     ) -> None:
         """Event 2: operation was approved (confirm_operation called)."""
-        self._write({
-            "event": "operation_approved",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "token": token,
-            "action": action,
-            "target": target,
-            "env_id": env_id,
-        })
+        self._write(
+            {
+                "event": "operation_approved",
+                "timestamp": datetime.now(UTC).isoformat(),
+                "token": token,
+                "action": action,
+                "target": target,
+                "env_id": env_id,
+            }
+        )
 
     def log_result(
         self,
@@ -273,7 +293,7 @@ class AuditLog:
         """Event 3: operation completed (success or failure)."""
         entry: dict[str, Any] = {
             "event": "operation_result",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "token": token,
             "action": action,
             "target": target,

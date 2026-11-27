@@ -8,10 +8,9 @@ from typing import Any
 import httpx
 from fastmcp import FastMCP
 
-from ..client import _build_headers, require_client
+from ..client import _build_headers, parse_stream_response, require_client
 from ..safety import (
     ToolClass,
-    compute_operation_hash,
     compute_resource_hash,
     get_audit_log,
     get_token_store,
@@ -77,7 +76,8 @@ def register(mcp: FastMCP) -> None:
                     if fresh_hash is not None and fresh_hash != stored_resource_hash:
                         logger.warning(
                             "Token %s: resource %s changed since proposal",
-                            token, entry["target"],
+                            token,
+                            entry["target"],
                         )
                         return {
                             "error": "Resource state has changed since the "
@@ -99,22 +99,40 @@ def register(mcp: FastMCP) -> None:
 
         try:
             kwargs: dict[str, Any] = {}
-            if entry.get("body") is not None:
-                kwargs["json"] = entry["body"]
+            body = entry.get("body")
+            encoding = entry.get("encoding", "json")
+            if body is not None:
+                if encoding == "multipart":
+                    # Plain text form fields: (None, value) tuples have no
+                    # filename, so httpx encodes them as multipart/form-data
+                    # text parts.  Do not set Content-Type — httpx must
+                    # generate the boundary.
+                    kwargs["files"] = {k: (None, str(v)) for k, v in body.items()}
+                else:
+                    kwargs["json"] = body
             if entry.get("params") is not None:
                 kwargs["params"] = entry["params"]
 
             resp = await client.request(method, endpoint, headers=headers, **kwargs)
             resp.raise_for_status()
-            result = resp.json()
+            if encoding == "stream":
+                # Arcane action endpoints (e.g. /system/upgrade) answer with
+                # newline-delimited JSON; resp.json() raises "Extra data".
+                result = parse_stream_response(resp)
+            else:
+                result = resp.json()
 
+            # A stream can complete transport-wise and still report a failure
+            # inside its event payload; record that in the audit trail.
+            stream_failed = encoding == "stream" and not result.get("success")
             audit_log.log_result(
                 token=token,
                 action=entry["action"],
                 target=entry["target"],
                 env_id=entry.get("env_id", "0"),
-                success=True,
+                success=not stream_failed,
                 result=result,
+                error=(result.get("error") or "stream reported failure") if stream_failed else None,
             )
             return result
 
@@ -189,6 +207,7 @@ def register(mcp: FastMCP) -> None:
     ) -> Any:
         """Return the classification label for a given tool classification value."""
         from ..safety import CLASSIFICATION_LABELS
+
         return {
             "classification": classification,
             "label": CLASSIFICATION_LABELS.get(ToolClass(classification), "Unknown"),
